@@ -5,6 +5,15 @@
 #include <string>
 #include <cstdlib>
 
+#ifdef _MSC_VER
+    #include <malloc.h>
+    #define aligned_alloc(alignment, size) _aligned_malloc(size, alignment)
+    #define aligned_free(ptr) _aligned_free(ptr)
+#else
+    #include <cstdlib>
+    #define aligned_free(ptr) free(ptr)
+#endif
+
 static void print_usage(const char* prog) {
     std::cerr << "Usage: " << prog
               << " --data <fbin_path>"

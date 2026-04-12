@@ -4,13 +4,23 @@
 #include "timer.h"
 
 #include <algorithm>
+#include <cfloat>
+#include <cmath>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <numeric>
 #include <random>
 #include <set>
 #include <stdexcept>
-#include <cstdlib>
+#ifdef _MSC_VER
+    #include <malloc.h>
+    #define aligned_alloc(alignment, size) _aligned_malloc(size, alignment)
+    #define aligned_free(ptr) _aligned_free(ptr)
+#else
+    #include <cstdlib>
+    #define aligned_free(ptr) free(ptr)
+#endif
 
 // ============================================================================
 // Destructor
@@ -21,6 +31,9 @@ VamanaIndex::~VamanaIndex() {
         std::free(data_);
         data_ = nullptr;
     }
+    if (quantized_data_) { std::free(quantized_data_); quantized_data_ = nullptr; }
+    if (quant_min_)      { std::free(quant_min_);      quant_min_ = nullptr; }
+    if (quant_scale_)    { std::free(quant_scale_);     quant_scale_ = nullptr; }
 }
 
 // ============================================================================
@@ -196,7 +209,7 @@ void VamanaIndex::build(const std::string& data_path, uint32_t R, uint32_t L,
     Timer build_timer;
 
     #pragma omp parallel for schedule(dynamic, 64)
-    for (size_t idx = 0; idx < npts_; idx++) {
+    for (int64_t idx = 0; idx < (int64_t)npts_; idx++) {
         uint32_t point = perm[idx];
 
         // Step 1: Search for this point in the current graph to find candidates
@@ -251,14 +264,163 @@ void VamanaIndex::build(const std::string& data_path, uint32_t R, uint32_t L,
 }
 
 // ============================================================================
+// Build Quantized Data
+// ============================================================================
+// Computes per-dimension min/scale and quantizes the entire dataset to uint8.
+// Quantization: q[d] = round((val[d] - min[d]) / scale[d]), clamped to [0,255]
+// Dequantization: val[d] ≈ q[d] * scale[d] + min[d]
+
+void VamanaIndex::build_quantized_data() {
+    if (npts_ == 0 || dim_ == 0 || data_ == nullptr)
+        throw std::runtime_error("Cannot quantize: data not loaded");
+
+    std::cout << "Building quantized data (uint8 scalar quantization)..." << std::endl;
+    Timer qt;
+
+    // Allocate per-dimension statistics
+    quant_min_   = static_cast<float*>(std::malloc(dim_ * sizeof(float)));
+    quant_scale_ = static_cast<float*>(std::malloc(dim_ * sizeof(float)));
+    if (!quant_min_ || !quant_scale_)
+        throw std::runtime_error("Failed to allocate quantization tables");
+
+    // Compute per-dimension min and max
+    for (uint32_t d = 0; d < dim_; d++) {
+        float dmin = FLT_MAX, dmax = -FLT_MAX;
+        for (uint32_t i = 0; i < npts_; i++) {
+            float val = data_[(size_t)i * dim_ + d];
+            if (val < dmin) dmin = val;
+            if (val > dmax) dmax = val;
+        }
+        quant_min_[d] = dmin;
+        float range = dmax - dmin;
+        quant_scale_[d] = (range > 1e-9f) ? (range / 255.0f) : 1.0f;
+    }
+
+    // Allocate quantized data (64-byte aligned for SIMD)
+    size_t qdata_size = (size_t)npts_ * dim_;
+    size_t aligned_size = (qdata_size + 63) & ~(size_t)63;
+    quantized_data_ = static_cast<uint8_t*>(aligned_alloc(64, aligned_size));
+    if (!quantized_data_)
+        throw std::runtime_error("Failed to allocate quantized data");
+
+    // Quantize all vectors
+    #pragma omp parallel for schedule(static)
+    for (int64_t i = 0; i < (int64_t)npts_; i++) {
+        const float* src = data_ + i * dim_;
+        uint8_t* dst = quantized_data_ + i * dim_;
+        for (uint32_t d = 0; d < dim_; d++) {
+            float normalized = (src[d] - quant_min_[d]) / quant_scale_[d];
+            int val = static_cast<int>(std::round(normalized));
+            dst[d] = static_cast<uint8_t>(std::max(0, std::min(255, val)));
+        }
+    }
+
+    has_quantized_ = true;
+    std::cout << "  Quantized " << npts_ << " vectors in "
+              << qt.elapsed_seconds() << "s" << std::endl;
+    std::cout << "  Quantized data size: "
+              << (qdata_size / (1024.0 * 1024.0)) << " MB (vs "
+              << ((size_t)npts_ * dim_ * sizeof(float) / (1024.0 * 1024.0))
+              << " MB float32)" << std::endl;
+}
+
+// ============================================================================
+// Greedy Search — Quantized (ADC)
+// ============================================================================
+// Same beam search algorithm as greedy_search(), but uses asymmetric distance
+// (float32 query vs uint8 dataset) for graph traversal. After the beam search
+// completes, all L candidates are re-ranked using exact float32 distances.
+
+std::pair<std::vector<VamanaIndex::Candidate>, uint32_t>
+VamanaIndex::greedy_search_quantized(const float* query, uint32_t L) const {
+    std::set<Candidate> candidate_set;
+    std::vector<bool> visited(npts_, false);
+    uint32_t dist_cmps = 0;
+
+    // Seed with start node (use asymmetric distance)
+    float start_dist = compute_l2sq_asymmetric(
+        query, get_quantized_vector(start_node_),
+        quant_min_, quant_scale_, dim_);
+    dist_cmps++;
+    candidate_set.insert({start_dist, start_node_});
+    visited[start_node_] = true;
+
+    std::set<uint32_t> expanded;
+
+    while (true) {
+        // Find closest un-expanded candidate
+        uint32_t best_node = UINT32_MAX;
+        for (const auto& [dist, id] : candidate_set) {
+            if (expanded.find(id) == expanded.end()) {
+                best_node = id;
+                break;
+            }
+        }
+        if (best_node == UINT32_MAX)
+            break;
+
+        expanded.insert(best_node);
+
+        // Copy neighbor list under lock
+        std::vector<uint32_t> neighbors;
+        {
+            std::lock_guard<std::mutex> lock(locks_[best_node]);
+            neighbors = graph_[best_node];
+        }
+
+        for (uint32_t nbr : neighbors) {
+            if (visited[nbr])
+                continue;
+            visited[nbr] = true;
+
+            // Asymmetric distance: float32 query vs uint8 data
+            float d = compute_l2sq_asymmetric(
+                query, get_quantized_vector(nbr),
+                quant_min_, quant_scale_, dim_);
+            dist_cmps++;
+
+            if (candidate_set.size() < L) {
+                candidate_set.insert({d, nbr});
+            } else {
+                auto worst = std::prev(candidate_set.end());
+                if (d < worst->first) {
+                    candidate_set.erase(worst);
+                    candidate_set.insert({d, nbr});
+                }
+            }
+        }
+    }
+
+    // Re-rank all L candidates with exact float32 distance
+    std::vector<Candidate> reranked;
+    reranked.reserve(candidate_set.size());
+    for (const auto& [approx_dist, id] : candidate_set) {
+        float exact_dist = compute_l2sq(query, get_vector(id), dim_);
+        reranked.push_back({exact_dist, id});
+    }
+    std::sort(reranked.begin(), reranked.end());
+
+    return {reranked, dist_cmps};
+}
+
+// ============================================================================
 // Search
 // ============================================================================
 
-SearchResult VamanaIndex::search(const float* query, uint32_t K, uint32_t L) const {
+SearchResult VamanaIndex::search(const float* query, uint32_t K, uint32_t L,
+                                 bool use_quantized) const {
     if (L < K) L = K;
 
     Timer t;
-    auto [candidates, dist_cmps] = greedy_search(query, L);
+    std::pair<std::vector<Candidate>, uint32_t> search_result;
+
+    if (use_quantized && has_quantized_) {
+        search_result = greedy_search_quantized(query, L);
+    } else {
+        search_result = greedy_search(query, L);
+    }
+
+    auto& [candidates, dist_cmps] = search_result;
     double latency = t.elapsed_us();
 
     // Return top-K results
@@ -293,7 +455,7 @@ void VamanaIndex::save(const std::string& path) const {
     out.write(reinterpret_cast<const char*>(&start_node_), 4);
 
     for (uint32_t i = 0; i < npts_; i++) {
-        uint32_t deg = graph_[i].size();
+        uint32_t deg = static_cast<uint32_t>(graph_[i].size());
         out.write(reinterpret_cast<const char*>(&deg), 4);
         if (deg > 0) {
             out.write(reinterpret_cast<const char*>(graph_[i].data()),

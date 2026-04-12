@@ -43,7 +43,10 @@ class VamanaIndex {
     //   query: pointer to query vector (must have dim_ floats)
     //   K:     number of nearest neighbors to return
     //   L:     search list size (L >= K)
-    SearchResult search(const float* query, uint32_t K, uint32_t L) const;
+    //   use_quantized: if true, use ADC (asymmetric distance) for traversal
+    //                  and re-rank final candidates with exact float32
+    SearchResult search(const float* query, uint32_t K, uint32_t L,
+                        bool use_quantized = false) const;
 
     // ---- Persistence ----
     // Save index (graph + metadata) to a binary file.
@@ -54,6 +57,11 @@ class VamanaIndex {
 
     uint32_t get_npts() const { return npts_; }
     uint32_t get_dim()  const { return dim_; }
+    bool has_quantized() const { return has_quantized_; }
+
+    // Build 8-bit scalar quantized representation of the dataset.
+    // Must be called after data is loaded (via build() or load()).
+    void build_quantized_data();
 
   private:
     // A candidate = (distance, node_id). Ordered by distance.
@@ -66,6 +74,11 @@ class VamanaIndex {
     std::pair<std::vector<Candidate>, uint32_t>
     greedy_search(const float* query, uint32_t L) const;
 
+    // Greedy search using quantized asymmetric distance.
+    // After traversal, re-ranks all L candidates with exact float32 distance.
+    std::pair<std::vector<Candidate>, uint32_t>
+    greedy_search_quantized(const float* query, uint32_t L) const;
+
     // Alpha-RNG pruning: selects a diverse subset of candidates as neighbors.
     // Modifies graph_[node] in place. Candidates should NOT include node itself.
     void robust_prune(uint32_t node, std::vector<Candidate>& candidates,
@@ -76,6 +89,12 @@ class VamanaIndex {
     uint32_t npts_    = 0;
     uint32_t dim_     = 0;
     bool     owns_data_ = false;  // whether we allocated data_
+
+    // ---- Quantized data (for ADC search) ----
+    uint8_t* quantized_data_ = nullptr;  // [npts x dim], row-major uint8
+    float*   quant_min_   = nullptr;     // per-dimension min [dim]
+    float*   quant_scale_ = nullptr;     // per-dimension scale [dim]
+    bool     has_quantized_ = false;
 
     // ---- Graph ----
     std::vector<std::vector<uint32_t>> graph_;  // adjacency lists
@@ -88,5 +107,8 @@ class VamanaIndex {
     // ---- Helpers ----
     const float* get_vector(uint32_t id) const {
         return data_ + (size_t)id * dim_;
+    }
+    const uint8_t* get_quantized_vector(uint32_t id) const {
+        return quantized_data_ + (size_t)id * dim_;
     }
 };
