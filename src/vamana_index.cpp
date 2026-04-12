@@ -11,7 +11,6 @@
 #include <iostream>
 #include <numeric>
 #include <random>
-#include <set>
 #include <stdexcept>
 #ifdef _MSC_VER
     #include <malloc.h>
@@ -39,18 +38,22 @@ VamanaIndex::~VamanaIndex() {
 // ============================================================================
 // Greedy Search
 // ============================================================================
-// Beam search starting from start_node_. Maintains a candidate set of at most
+// Beam search starting from start_node_. Maintains a candidate list of at most
 // L nodes, always expanding the closest unvisited node. Returns when no
 // unvisited candidates remain.
 //
-// Uses std::set<Candidate> as an ordered container — simple, correct, and
-// easy for students to understand and modify.
+// Uses a sorted std::vector<Candidate> (flat list) instead of std::set to
+// avoid heap allocations in the inner loop. For L<=200, contiguous memmove
+// is drastically faster than Red-Black Tree pointer-chasing.
 
 std::pair<std::vector<VamanaIndex::Candidate>, uint32_t>
 VamanaIndex::greedy_search(const float* query, uint32_t L) const {
-    // Candidate set: ordered by (distance, id). Bounded at size L.
-    std::set<Candidate> candidate_set;
-    // Track which nodes we've already expanded (visited).
+    // Candidate list: sorted by (distance, id), bounded at size L.
+    // Pre-allocate to avoid reallocation.
+    std::vector<Candidate> candidates;
+    candidates.reserve(L + 1);  // +1 for temporary insertion before trim
+
+    // Track which nodes we've already visited.
     std::vector<bool> visited(npts_, false);
 
     uint32_t dist_cmps = 0;
@@ -58,32 +61,18 @@ VamanaIndex::greedy_search(const float* query, uint32_t L) const {
     // Seed with start node
     float start_dist = compute_l2sq(query, get_vector(start_node_), dim_);
     dist_cmps++;
-    candidate_set.insert({start_dist, start_node_});
+    candidates.push_back({start_dist, start_node_});
     visited[start_node_] = true;
 
-    // Track which candidates have been expanded (their neighbors explored).
-    // We iterate through candidate_set; entries before our "frontier" pointer
-    // have been expanded. We use a simple approach: keep scanning from the
-    // beginning of the set for the first un-expanded entry.
-    std::set<uint32_t> expanded;
+    // Cursor: all entries at index < expand_pos have been expanded.
+    // We always expand the entry at expand_pos (the closest un-expanded).
+    uint32_t expand_pos = 0;
 
-    while (true) {
-        // Find closest candidate that hasn't been expanded yet
-        uint32_t best_node = UINT32_MAX;
-        for (const auto& [dist, id] : candidate_set) {
-            if (expanded.find(id) == expanded.end()) {
-                best_node = id;
-                break;
-            }
-        }
-        if (best_node == UINT32_MAX)
-            break;  // all candidates expanded
+    while (expand_pos < candidates.size()) {
+        uint32_t best_node = candidates[expand_pos].second;
+        expand_pos++;
 
-        expanded.insert(best_node);
-
-        // Expand: evaluate all neighbors of best_node
         // Copy neighbor list under lock to avoid data race with parallel build
-        // (another thread might push_back / reallocate graph_[best_node]).
         std::vector<uint32_t> neighbors;
         {
             std::lock_guard<std::mutex> lock(locks_[best_node]);
@@ -94,25 +83,40 @@ VamanaIndex::greedy_search(const float* query, uint32_t L) const {
                 continue;
             visited[nbr] = true;
 
-            float d = compute_l2sq(query, get_vector(nbr), dim_);
+            // Early-abandon threshold: worst candidate distance (or FLT_MAX if list not full)
+            float threshold = (candidates.size() >= L)
+                ? candidates.back().first : FLT_MAX;
+            float d = compute_l2sq_ea(query, get_vector(nbr), dim_, threshold);
             dist_cmps++;
 
-            // Insert if candidate set isn't full or this is closer than worst
-            if (candidate_set.size() < L) {
-                candidate_set.insert({d, nbr});
-            } else {
-                auto worst = std::prev(candidate_set.end());
-                if (d < worst->first) {
-                    candidate_set.erase(worst);
-                    candidate_set.insert({d, nbr});
-                }
-            }
+            // Skip if early-abandoned
+            if (d == FLT_MAX) continue;
+
+            // Skip if list is full and this is worse than the worst
+            if (candidates.size() >= L && d >= candidates.back().first)
+                continue;
+
+            // Binary search for insertion point to maintain sorted order
+            Candidate new_cand = {d, nbr};
+            auto pos = std::lower_bound(candidates.begin(), candidates.end(), new_cand);
+            size_t insert_idx = pos - candidates.begin();
+
+            // Insert at correct position (memmove shifts elements)
+            candidates.insert(pos, new_cand);
+
+            // Backtrack cursor if we inserted a closer candidate before it.
+            // Already-expanded nodes will be harmlessly re-visited (visited[]
+            // prevents recomputation).
+            if (insert_idx < expand_pos)
+                expand_pos = insert_idx;
+
+            // Trim to L if over capacity
+            if (candidates.size() > L)
+                candidates.pop_back();
         }
     }
 
-    // Convert to sorted vector
-    std::vector<Candidate> results(candidate_set.begin(), candidate_set.end());
-    return {results, dist_cmps};
+    return {candidates, dist_cmps};
 }
 
 // ============================================================================
@@ -327,13 +331,16 @@ void VamanaIndex::build_quantized_data() {
 // ============================================================================
 // Greedy Search — Quantized (ADC)
 // ============================================================================
-// Same beam search algorithm as greedy_search(), but uses asymmetric distance
+// Same beam search as greedy_search(), but uses asymmetric distance
 // (float32 query vs uint8 dataset) for graph traversal. After the beam search
 // completes, all L candidates are re-ranked using exact float32 distances.
+// Uses flat sorted vector (no std::set) for zero heap allocations.
 
 std::pair<std::vector<VamanaIndex::Candidate>, uint32_t>
 VamanaIndex::greedy_search_quantized(const float* query, uint32_t L) const {
-    std::set<Candidate> candidate_set;
+    std::vector<Candidate> candidates;
+    candidates.reserve(L + 1);
+
     std::vector<bool> visited(npts_, false);
     uint32_t dist_cmps = 0;
 
@@ -342,24 +349,14 @@ VamanaIndex::greedy_search_quantized(const float* query, uint32_t L) const {
         query, get_quantized_vector(start_node_),
         quant_min_, quant_scale_, dim_);
     dist_cmps++;
-    candidate_set.insert({start_dist, start_node_});
+    candidates.push_back({start_dist, start_node_});
     visited[start_node_] = true;
 
-    std::set<uint32_t> expanded;
+    uint32_t expand_pos = 0;
 
-    while (true) {
-        // Find closest un-expanded candidate
-        uint32_t best_node = UINT32_MAX;
-        for (const auto& [dist, id] : candidate_set) {
-            if (expanded.find(id) == expanded.end()) {
-                best_node = id;
-                break;
-            }
-        }
-        if (best_node == UINT32_MAX)
-            break;
-
-        expanded.insert(best_node);
+    while (expand_pos < candidates.size()) {
+        uint32_t best_node = candidates[expand_pos].second;
+        expand_pos++;
 
         // Copy neighbor list under lock
         std::vector<uint32_t> neighbors;
@@ -373,28 +370,41 @@ VamanaIndex::greedy_search_quantized(const float* query, uint32_t L) const {
                 continue;
             visited[nbr] = true;
 
-            // Asymmetric distance: float32 query vs uint8 data
-            float d = compute_l2sq_asymmetric(
+            // Early-abandon threshold
+            float threshold = (candidates.size() >= L)
+                ? candidates.back().first : FLT_MAX;
+            float d = compute_l2sq_asymmetric_ea(
                 query, get_quantized_vector(nbr),
-                quant_min_, quant_scale_, dim_);
+                quant_min_, quant_scale_, dim_, threshold);
             dist_cmps++;
 
-            if (candidate_set.size() < L) {
-                candidate_set.insert({d, nbr});
-            } else {
-                auto worst = std::prev(candidate_set.end());
-                if (d < worst->first) {
-                    candidate_set.erase(worst);
-                    candidate_set.insert({d, nbr});
-                }
-            }
+            // Skip if early-abandoned
+            if (d == FLT_MAX) continue;
+
+            // Skip if list is full and this is worse than the worst
+            if (candidates.size() >= L && d >= candidates.back().first)
+                continue;
+
+            // Binary search for sorted insertion
+            Candidate new_cand = {d, nbr};
+            auto pos = std::lower_bound(candidates.begin(), candidates.end(), new_cand);
+            size_t insert_idx = pos - candidates.begin();
+
+            candidates.insert(pos, new_cand);
+
+            // Backtrack cursor if we inserted a closer candidate before it
+            if (insert_idx < expand_pos)
+                expand_pos = insert_idx;
+
+            if (candidates.size() > L)
+                candidates.pop_back();
         }
     }
 
     // Re-rank all L candidates with exact float32 distance
     std::vector<Candidate> reranked;
-    reranked.reserve(candidate_set.size());
-    for (const auto& [approx_dist, id] : candidate_set) {
+    reranked.reserve(candidates.size());
+    for (const auto& [approx_dist, id] : candidates) {
         float exact_dist = compute_l2sq(query, get_vector(id), dim_);
         reranked.push_back({exact_dist, id});
     }

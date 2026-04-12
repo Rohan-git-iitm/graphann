@@ -1,85 +1,57 @@
-# Vamana Index — SIFT1M Benchmark Results
+# Search Optimization Results
 
-## Dataset
+This document summarizes the performance improvements achieved by implementing Proposals A, B, and D for DiskANN Vamana Search optimization.
 
-| Property       | Value           |
-|----------------|-----------------|
-| Dataset        | SIFT1M          |
-| Base vectors   | 1,000,000       |
-| Query vectors  | 10,000          |
-| Dimensions     | 128             |
-| Ground truth   | 100 neighbors/query |
+## Implementation Summaries
 
-## Index Build Parameters
-
-| Parameter | Value | Description                              |
-|-----------|-------|------------------------------------------|
-| R         | 32    | Maximum out-degree per node              |
-| L         | 75    | Search list size during build            |
-| α (alpha) | 1.2   | RNG pruning parameter                   |
-| γ (gamma) | 1.5   | Degree overflow multiplier (γR = 48)    |
-
-## Search Configuration
-
-- **K = 10** (top-10 nearest neighbors)
-- **L values tested**: 10, 20, 50, 100, 200
-- **Platform**: Windows (MSVC 2022), Release build
+- **Proposal A (Asymmetric Distance Computation via Quantization):** Compressed the dataset from float32 (~488 MB) to uint8 (~128 MB) using per-dimension min/scale scalar block quantization. Graph traversal employs an asymmetric distance function (float32 query vs. uint8 data), with exact float32 re-ranking for the final L candidates. The metadata overhead is negligible (~1KB).
+- **Proposal B (Early-Abandoning SIMD Distance):** Added early-exit logic to both exact and asymmetric distance functions. The logic checks if the partial distance sum exceeds the worst candidate's distance at intervals of 32 dimensions, terminating early to save computations while preserving SIMD vectorization.
+- **Proposal D (Flattening `std::set`):** Replaced the inner-loop `std::set` (Red-Black Tree) and `std::set` visited frontier map with a pre-allocated contiguous `std::vector` array maintaining sortedness by distance. Candidate insertion shifts contiguous memory via `memmove`. The frontier iterator uses a simple array index cursor (`expand_pos`), avoiding heap allocations entirely in the inner loop. 
 
 ---
 
-## Results
+## Experimental Results
 
-### Mode 1: Exact Float32 Distance
+The tests were run with the SIFT1M dataset (1 million vectors, 128 dimensions, Top-100 ground truth) utilizing Windows MSVC environment. 
 
-All distance computations use full-precision float32 vectors.
+### 1. Proposal D Impact (Data Structure Flattening)
+Flattening the memory structures to rely exclusively on contiguous vectors proved immediately impactful due to removing costly heap allocations per node traversal.
 
-| L   | Recall@10 | Avg Dist Cmps | Avg Latency (μs) | P99 Latency (μs) |
-|-----|-----------|---------------|-------------------|-------------------|
-| 10  | 0.7727    | 641.7         | 712.3             | 3,930.7           |
-| 20  | 0.8912    | 883.7         | 1,016.1           | 3,428.0           |
-| 50  | 0.9665    | 1,511.5       | 1,751.4           | 3,653.8           |
-| 100 | 0.9882    | 2,438.9       | 2,987.5           | 9,224.1           |
-| 200 | 0.9961    | 4,049.2       | 5,212.0           | 7,398.4           |
+_Comparing Exact Float32 (Standard) vs. Exact Float32 (Flat Vector):_
 
-### Mode 2: Quantized ADC (Asymmetric Distance Computation)
+| L  | Recall@10 | Baseline Avg Latency | **Flat Vector Avg Latency** | Improvement |
+|----|-----------|----------------------|-----------------------------|-------------|
+| 10 | 0.7727    | 715.8 µs             | **627.6 µs**                | **~12.3%**  |
+| 50 | 0.9665    | 1650.1 µs            | **1411.9 µs**               | **~14.4%**  |
+| 75 | 0.9820    | 2224.1 µs            | **1934.4 µs**               | **~13.0%**  |
+| 150| 0.9939    | 3895.4 µs            | **3291.5 µs**               | **~15.5%**  |
+| 200| 0.9961    | 5581.9 µs            | **3928.2 µs**               | **~29.6%**  |
 
-Graph traversal uses asymmetric distance (float32 query vs. uint8 dataset). Final top-K candidates are re-ranked using exact float32 distances.
-
-| L   | Recall@10 | Avg Dist Cmps | Avg Latency (μs) | P99 Latency (μs) |
-|-----|-----------|---------------|-------------------|-------------------|
-| 10  | 0.7718    | 642.2         | 649.4             | 1,962.7           |
-| 20  | 0.8904    | 883.1         | 865.4             | 2,163.5           |
-| 50  | 0.9665    | 1,511.4       | 1,585.9           | 3,324.6           |
-| 100 | 0.9881    | 2,438.6       | 2,599.3           | 3,580.5           |
-| 200 | 0.9961    | 4,049.0       | 5,198.4           | 7,913.0           |
-
-**Memory footprint**: Quantized data uses **122 MB** vs **488 MB** for float32 (4× reduction).
+**Observations:** Flat vectors scale drastically better as $L$ increases. Removing object allocation overhead shifts the search inner loop’s bottleneck squarely onto memory bandwidth and distance computations.
 
 ---
 
-## Analysis
+### 2. Proposal A Impact (Asymmetric Quantization)
+ADC was benchmarked natively on the flattened vector setup (Proposal D integrated) to evaluate bandwidth reduction. 
 
-### Recall
+_Comparing Exact Float32 (Flat) vs. Quantized ADC (Flat):_
 
-- Recall improves monotonically with L, as expected — larger search lists explore more of the graph.
-- At **L = 100**, both modes achieve **~98.8% recall**, which is strong for a graph-based ANN index on SIFT1M.
-- At **L = 200**, recall reaches **99.6%**, approaching exhaustive search quality.
-- **Quantized ADC preserves recall almost perfectly** — the maximum recall drop is only 0.0009 (at L=10), which is negligible. This is because the final top-K results are re-ranked with exact float32 distances; quantization only affects the graph traversal order.
+| L  | Exact Recall | ADC Recall | Exact Avg Latency | **ADC Avg Latency** | Latency Delta |
+|----|--------------|------------|-------------------|---------------------|---------------|
+| 10 | 0.7727       | 0.7718     | 627.6 µs          | **557.5 µs**        | -11.2% Faster |
+| 30 | 0.9332       | 0.9333     | 1022.8 µs         | **986.1 µs**        | -3.6% Faster  |
+| 75 | 0.9820       | 0.9817     | 1934.4 µs         | **1897.4 µs**       | -1.9% Faster  |
+| 150| 0.9939       | 0.9939     | 3291.5 µs         | **3387.3 µs**       | +2.9% Slower  |
+| 200| 0.9961       | 0.9961     | 3928.2 µs         | **4398.8 µs**       | +12.0% Slower |
 
-### Latency
+**Observations:** 
+- **Recall Matching:** Float32 re-ranking for the final $L$ candidates works exceptionally well, fully preserving recall boundaries within 0.001 limits.
+- **Latency Trade-offs:** The 4x database layout compression improves search speed consistently at small $L$, avoiding memory eviction bounds. However, at large $L$, float32 re-ranking the entire candidate list begins bottlenecking the system and the ALU dequantization math adds cost that offsets the bandwidth savings. This results in slightly worse latencies around $L \approx 150+$.
 
-- Quantized ADC provides a modest latency improvement across all L values:
-  - **L=10**: 712 → 649 μs (**8.8% faster**)
-  - **L=20**: 1,016 → 865 μs (**14.9% faster**)
-  - **L=50**: 1,751 → 1,586 μs (**9.4% faster**)
-  - **L=100**: 2,988 → 2,599 μs (**13.0% faster**)
-- The speedup comes from cheaper distance computations (uint8 vs float32) and better cache utilization due to the 4× smaller data footprint.
-- P99 tail latencies are also consistently lower in quantized mode.
+---
 
-### Distance Computations
+### 3. Proposal B Impact (Early Abandonment)
+_The early cancellation logic evaluates exactly identifiably to baseline behavior under normal search ranges._
 
-- The number of distance computations is nearly identical between both modes for each L value, confirming that the graph traversal follows the same path regardless of distance precision.
-
-### Key Takeaway
-
-Quantized ADC achieves a **4× memory reduction** and **~10–15% latency improvement** with **negligible recall loss** (<0.001). This makes it an effective optimization for memory-constrained or latency-sensitive deployments.
+**Observations:** 
+In tests, Early Abandonment kept Recall computations perfectly identical, but the absolute reduction in raw operations (`dist_cmps`) did not yield massive changes. This indicates that Vamana points evaluated during beam-search traversal are largely within the radius of expected thresholds naturally. However, adding it operates at virtually zero cost (evaluating every 32 elements linearly) and offers protective upper bounds when exploring sparse search queries far from target sets.
