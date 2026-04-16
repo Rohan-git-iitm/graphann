@@ -1,6 +1,6 @@
 # Search Optimization Results
 
-This document summarizes the performance improvements achieved by implementing Proposals A, B, and D for DiskANN Vamana Search optimization.
+This document summarizes the performance improvements achieved by implementing Proposals A, B, C and D for DiskANN Vamana Search optimization.
 
 ## Implementation Summaries
 
