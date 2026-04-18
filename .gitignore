@@ -3,3 +3,5 @@ tmp/
 *.bin
 *.fbin
 *.ibin
+data/
+build/

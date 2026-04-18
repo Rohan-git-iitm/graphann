@@ -11,15 +11,16 @@
 #include <vector>
 #include <cstdlib>
 #ifdef _MSC_VER
-    #include <malloc.h>
-    #define aligned_alloc(alignment, size) _aligned_malloc(size, alignment)
-    #define aligned_free(ptr) _aligned_free(ptr)
+#include <malloc.h>
+#define aligned_alloc(alignment, size) _aligned_malloc(size, alignment)
+#define aligned_free(ptr) _aligned_free(ptr)
 #else
-    #include <cstdlib>
-    #define aligned_free(ptr) free(ptr)
+#include <cstdlib>
+#define aligned_free(ptr) free(ptr)
 #endif
 
-static void print_usage(const char* prog) {
+static void print_usage(const char *prog)
+{
     std::cerr << "Usage: " << prog
               << " --index <index_path>"
               << " --data <fbin_path>"
@@ -29,15 +30,19 @@ static void print_usage(const char* prog) {
               << " --L <comma_separated_L_values>"
               << " [--quantized]"
               << " [--dynamic]"
+              << " [--pca] [--pca_dim <dims=32>]"
+              << " [--refine_quant]"
               << std::endl;
 }
 
 // Parse comma-separated L values like "10,20,50,100"
-static std::vector<uint32_t> parse_L_values(const std::string& s) {
+static std::vector<uint32_t> parse_L_values(const std::string &s)
+{
     std::vector<uint32_t> values;
     std::istringstream stream(s);
     std::string token;
-    while (std::getline(stream, token, ',')) {
+    while (std::getline(stream, token, ','))
+    {
         values.push_back(std::atoi(token.c_str()));
     }
     std::sort(values.begin(), values.end());
@@ -45,12 +50,16 @@ static std::vector<uint32_t> parse_L_values(const std::string& s) {
 }
 
 // Compute recall@K: fraction of true top-K neighbors found in result
-static double compute_recall(const std::vector<uint32_t>& result,
-                             const uint32_t* gt, uint32_t K) {
+static double compute_recall(const std::vector<uint32_t> &result,
+                             const uint32_t *gt, uint32_t K)
+{
     uint32_t found = 0;
-    for (uint32_t i = 0; i < K && i < result.size(); i++) {
-        for (uint32_t j = 0; j < K; j++) {
-            if (result[i] == gt[j]) {
+    for (uint32_t i = 0; i < K && i < result.size(); i++)
+    {
+        for (uint32_t j = 0; j < K; j++)
+        {
+            if (result[i] == gt[j])
+            {
                 found++;
                 break;
             }
@@ -59,42 +68,67 @@ static double compute_recall(const std::vector<uint32_t>& result,
     return (double)found / K;
 }
 
-int main(int argc, char** argv) {
+int main(int argc, char **argv)
+{
     std::string index_path, data_path, query_path, gt_path, L_str;
     uint32_t K = 10;
     bool use_quantized = false;
     bool dynamic_L = false;
+    bool use_pca = false;
+    uint32_t pca_dim = 32;
+    bool refine_quant = false;
     float dyn_floor_ratio = 0.5f;
     float dyn_exp_mult = 2.0f;
     uint32_t dyn_hops = 10;
 
-    for (int i = 1; i < argc; i++) {
+    for (int i = 1; i < argc; i++)
+    {
         std::string arg = argv[i];
-        if (arg == "--index" && i + 1 < argc)    index_path = argv[++i];
-        else if (arg == "--data" && i + 1 < argc) data_path = argv[++i];
-        else if (arg == "--queries" && i + 1 < argc) query_path = argv[++i];
-        else if (arg == "--gt" && i + 1 < argc)   gt_path = argv[++i];
-        else if (arg == "--K" && i + 1 < argc)    K = std::atoi(argv[++i]);
-        else if (arg == "--L" && i + 1 < argc)    L_str = argv[++i];
-        else if (arg == "--quantized")             use_quantized = true;
-        else if (arg == "--dynamic")               dynamic_L = true;
-        else if (arg == "--dyn-floor-ratio" && i + 1 < argc) dyn_floor_ratio = std::atof(argv[++i]);
-        else if (arg == "--dyn-exp-mult" && i + 1 < argc)    dyn_exp_mult = std::atof(argv[++i]);
-        else if (arg == "--dyn-hops" && i + 1 < argc)        dyn_hops = std::atoi(argv[++i]);
-        else if (arg == "--help" || arg == "-h") {
+        if (arg == "--index" && i + 1 < argc)
+            index_path = argv[++i];
+        else if (arg == "--data" && i + 1 < argc)
+            data_path = argv[++i];
+        else if (arg == "--queries" && i + 1 < argc)
+            query_path = argv[++i];
+        else if (arg == "--gt" && i + 1 < argc)
+            gt_path = argv[++i];
+        else if (arg == "--K" && i + 1 < argc)
+            K = std::atoi(argv[++i]);
+        else if (arg == "--L" && i + 1 < argc)
+            L_str = argv[++i];
+        else if (arg == "--quantized")
+            use_quantized = true;
+        else if (arg == "--dynamic")
+            dynamic_L = true;
+        else if (arg == "--pca")
+            use_pca = true;
+        else if (arg == "--refine_quant")
+            refine_quant = true;
+        else if (arg == "--pca_dim" && i + 1 < argc)
+            pca_dim = std::atoi(argv[++i]);
+        else if (arg == "--dyn-floor-ratio" && i + 1 < argc)
+            dyn_floor_ratio = std::atof(argv[++i]);
+        else if (arg == "--dyn-exp-mult" && i + 1 < argc)
+            dyn_exp_mult = std::atof(argv[++i]);
+        else if (arg == "--dyn-hops" && i + 1 < argc)
+            dyn_hops = std::atoi(argv[++i]);
+        else if (arg == "--help" || arg == "-h")
+        {
             print_usage(argv[0]);
             return 0;
         }
     }
 
     if (index_path.empty() || data_path.empty() || query_path.empty() ||
-        gt_path.empty() || L_str.empty()) {
+        gt_path.empty() || L_str.empty())
+    {
         print_usage(argv[0]);
         return 1;
     }
 
     std::vector<uint32_t> L_values = parse_L_values(L_str);
-    if (L_values.empty()) {
+    if (L_values.empty())
+    {
         std::cerr << "Error: no L values provided." << std::endl;
         return 1;
     }
@@ -105,8 +139,17 @@ int main(int argc, char** argv) {
     index.load(index_path, data_path);
 
     // --- Build quantized representation if requested ---
-    if (use_quantized) {
+    if (use_quantized || refine_quant)
+    {
         index.build_quantized_data();
+    }
+    if (refine_quant)
+    {
+        index.refine_with_quantization();
+    }
+    if (use_pca)
+    {
+        index.build_pca(pca_dim);
     }
 
     // --- Load queries ---
@@ -114,7 +157,8 @@ int main(int argc, char** argv) {
     FloatMatrix queries = load_fbin(query_path);
     std::cout << "  Queries: " << queries.npts << " x " << queries.dims << std::endl;
 
-    if (queries.dims != index.get_dim()) {
+    if (queries.dims != index.get_dim())
+    {
         std::cerr << "Error: query dimension (" << queries.dims
                   << ") != index dimension (" << index.get_dim() << ")" << std::endl;
         return 1;
@@ -125,12 +169,14 @@ int main(int argc, char** argv) {
     IntMatrix gt = load_ibin(gt_path);
     std::cout << "  Ground truth: " << gt.npts << " x " << gt.dims << std::endl;
 
-    if (gt.npts != queries.npts) {
+    if (gt.npts != queries.npts)
+    {
         std::cerr << "Error: ground truth rows (" << gt.npts
                   << ") != number of queries (" << queries.npts << ")" << std::endl;
         return 1;
     }
-    if (gt.dims < K) {
+    if (gt.dims < K)
+    {
         std::cerr << "Warning: ground truth has " << gt.dims
                   << " neighbors per query but K=" << K << std::endl;
         K = gt.dims;
@@ -139,13 +185,15 @@ int main(int argc, char** argv) {
     uint32_t nq = queries.npts;
 
     // --- Run search for each L value ---
-    std::string mode_str = use_quantized ? "Quantized ADC" : "Exact Float32";
-    if (dynamic_L) mode_str += " (Dynamic Beam)";
-    
+    std::string mode_str = use_pca ? "PCA Projection" : (use_quantized ? "Quantized ADC" : "Exact Float32");
+    if (dynamic_L)
+        mode_str += " (Dynamic Beam)";
+
     std::cout << "\n=== Search Results (K=" << K
               << ", Mode=" << mode_str << ") ===" << std::endl;
-    if (dynamic_L) {
-        std::cout << "Dynamic Params: FloorRatio=" << dyn_floor_ratio 
+    if (dynamic_L)
+    {
+        std::cout << "Dynamic Params: FloorRatio=" << dyn_floor_ratio
                   << " ExpMult=" << dyn_exp_mult
                   << " Hops=" << dyn_hops << std::endl;
     }
@@ -157,14 +205,16 @@ int main(int argc, char** argv) {
               << std::endl;
     std::cout << std::string(74, '-') << std::endl;
 
-    for (uint32_t L : L_values) {
+    for (uint32_t L : L_values)
+    {
         std::vector<double> recalls(nq);
         std::vector<uint32_t> dist_cmps(nq);
         std::vector<double> latencies(nq);
 
-        #pragma omp parallel for schedule(dynamic, 16)
-        for (int32_t q = 0; q < (int32_t)nq; q++) {
-            SearchResult res = index.search(queries.row(q), K, L, use_quantized, dynamic_L, dyn_floor_ratio, dyn_exp_mult, dyn_hops);
+#pragma omp parallel for schedule(dynamic, 16)
+        for (int32_t q = 0; q < (int32_t)nq; q++)
+        {
+            SearchResult res = index.search(queries.row(q), K, L, use_quantized, dynamic_L, dyn_floor_ratio, dyn_exp_mult, dyn_hops, use_pca);
 
             recalls[q] = compute_recall(res.ids, gt.row(q), K);
             dist_cmps[q] = res.dist_cmps;

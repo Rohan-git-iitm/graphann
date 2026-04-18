@@ -6,15 +6,16 @@
 #include <cstdlib>
 
 #ifdef _MSC_VER
-    #include <malloc.h>
-    #define aligned_alloc(alignment, size) _aligned_malloc(size, alignment)
-    #define aligned_free(ptr) _aligned_free(ptr)
+#include <malloc.h>
+#define aligned_alloc(alignment, size) _aligned_malloc(size, alignment)
+#define aligned_free(ptr) _aligned_free(ptr)
 #else
-    #include <cstdlib>
-    #define aligned_free(ptr) free(ptr)
+#include <cstdlib>
+#define aligned_free(ptr) free(ptr)
 #endif
 
-static void print_usage(const char* prog) {
+static void print_usage(const char *prog)
+{
     std::cerr << "Usage: " << prog
               << " --data <fbin_path>"
               << " --output <index_path>"
@@ -22,33 +23,55 @@ static void print_usage(const char* prog) {
               << " [--L <build_search_list=75>]"
               << " [--alpha <rng_alpha=1.2>]"
               << " [--gamma <degree_multiplier=1.5>]"
+              << " [--entry_points <num_entry_points=1>]"
+              << " [--single_pass]"
+              << " [--refine_quant]"
               << std::endl;
 }
 
-int main(int argc, char** argv) {
+int main(int argc, char **argv)
+{
     // Defaults
     std::string data_path, output_path;
     uint32_t R = 32;
     uint32_t L = 75;
     float alpha = 1.2f;
     float gamma = 1.5f;
+    uint32_t entry_points = 1;
+    bool two_pass = true;
+    bool refine_quant = false;
 
     // Parse arguments
-    for (int i = 1; i < argc; i++) {
+    for (int i = 1; i < argc; i++)
+    {
         std::string arg = argv[i];
-        if (arg == "--data" && i + 1 < argc)       data_path = argv[++i];
-        else if (arg == "--output" && i + 1 < argc) output_path = argv[++i];
-        else if (arg == "--R" && i + 1 < argc)      R = std::atoi(argv[++i]);
-        else if (arg == "--L" && i + 1 < argc)      L = std::atoi(argv[++i]);
-        else if (arg == "--alpha" && i + 1 < argc)  alpha = std::atof(argv[++i]);
-        else if (arg == "--gamma" && i + 1 < argc)  gamma = std::atof(argv[++i]);
-        else if (arg == "--help" || arg == "-h") {
+        if (arg == "--data" && i + 1 < argc)
+            data_path = argv[++i];
+        else if (arg == "--output" && i + 1 < argc)
+            output_path = argv[++i];
+        else if (arg == "--R" && i + 1 < argc)
+            R = std::atoi(argv[++i]);
+        else if (arg == "--L" && i + 1 < argc)
+            L = std::atoi(argv[++i]);
+        else if (arg == "--alpha" && i + 1 < argc)
+            alpha = std::atof(argv[++i]);
+        else if (arg == "--gamma" && i + 1 < argc)
+            gamma = std::atof(argv[++i]);
+        else if (arg == "--entry_points" && i + 1 < argc)
+            entry_points = std::atoi(argv[++i]);
+        else if (arg == "--single_pass")
+            two_pass = false;
+        else if (arg == "--refine_quant")
+            refine_quant = true;
+        else if (arg == "--help" || arg == "-h")
+        {
             print_usage(argv[0]);
             return 0;
         }
     }
 
-    if (data_path.empty() || output_path.empty()) {
+    if (data_path.empty() || output_path.empty())
+    {
         print_usage(argv[0]);
         return 1;
     }
@@ -59,11 +82,14 @@ int main(int argc, char** argv) {
     std::cout << "  L     = " << L << std::endl;
     std::cout << "  alpha = " << alpha << std::endl;
     std::cout << "  gamma = " << gamma << std::endl;
+    std::cout << "  entry_points = " << entry_points << std::endl;
+    std::cout << "  two_pass     = " << (two_pass ? "yes" : "no") << std::endl;
+    std::cout << "  refine_quant = " << (refine_quant ? "yes" : "no") << std::endl;
 
     VamanaIndex index;
 
     Timer total_timer;
-    index.build(data_path, R, L, alpha, gamma);
+    index.build(data_path, R, L, alpha, gamma, entry_points, two_pass);
     double total_time = total_timer.elapsed_seconds();
 
     std::cout << "\nTotal build time: " << total_time << " seconds" << std::endl;
